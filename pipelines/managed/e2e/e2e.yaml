@@ -56,7 +56,7 @@ spec:
     - name: ociStorage
       type: string
       description: The OCI repository where the Trusted Artifacts are stored
-      default: "quay.io/konflux-ci/release-service-trusted-artifacts"
+      default: "quay.io/rhtap-test-local/perf-release-service-trusted-artifacts"
     - name: trustedArtifactsDebug
       description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable
       type: string
