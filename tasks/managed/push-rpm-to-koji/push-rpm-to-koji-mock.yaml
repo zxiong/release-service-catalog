@@ -1,0 +1,395 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: push-rpm-to-koji-mock
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: push-koji-mock
+spec:
+  description: |-
+    Mock version of push-rpm-to-koji task for testing without Koji/Brew credentials.
+    Mocks: kinit, koji commands. Real: oras pull (container image operations).
+  params:
+    - name: snapshotPath
+      type: string
+      description: |
+        Path to the JSON file of the mapped Snapshot spec in the data workspace
+    - name: dataPath
+      type: string
+      description: |
+        Path to the JSON file of the merged data to use in the data workspace
+    - name: pushSecret
+      type: string
+      description: |
+        The secret that is used for login koji instance (MOCKED - not actually used)
+    - name: pipelineImage
+      type: string
+      description: |
+        The image url with koji (1.34 or higher), jq and kinit installed for
+        running the push-rpm-to-koji task, please make sure you have such image
+        or you build this image first
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+      default: "empty"
+    - name: sourceDataArtifact
+      type: string
+      description: Location of trusted artifacts to be used to populate data directory
+      default: ""
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire
+      type: string
+      default: "1d"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable
+      type: string
+      default: ""
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+      default: /var/workdir/release
+    - name: taskGitUrl
+      type: string
+      description: The url to the git repo where the release-service-catalog tasks and stepactions to be used are stored
+    - name: taskGitRevision
+      type: string
+      description: The revision in the taskGitUrl repo to be used
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+    # Mock-specific parameters
+    - name: mockBuildId
+      type: string
+      description: "Mock build ID to return from CGInitBuild"
+      default: "12345"
+  results:
+    - name: sourceDataArtifact
+      type: string
+      description: Produced trusted data artifact
+  volumes:
+    - name: secret-volume
+      secret:
+        secretName: $(params.pushSecret)
+        optional: true
+    - name: workdir
+      emptyDir: {}
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+    env:
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
+      - name: "ORAS_OPTIONS"
+        value: "$(params.orasOptions)"
+      - name: "DEBUG"
+        value: "$(params.trustedArtifactsDebug)"
+      - name: MOCK_BUILD_ID
+        value: $(params.mockBuildId)
+    securityContext:
+      runAsUser: 1001
+  steps:
+    - name: use-trusted-artifact
+      computeResources:
+        limits:
+          memory: 64Mi
+          cpu: 30m
+        requests:
+          memory: 64Mi
+          cpu: 30m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/use-trusted-artifact/use-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(params.sourceDataArtifact)
+    - name: push-rpm-to-koji
+      image: "$(params.pipelineImage)"
+      computeResources:
+        limits:
+          memory: 256Mi
+          cpu: 325m
+        requests:
+          memory: 256Mi
+          cpu: 325m
+      env:
+        - name: SNAPSHOT_SPEC_FILE
+          value: $(params.dataDir)/$(params.snapshotPath)
+        - name: DATA_FILE
+          value: $(params.dataDir)/$(params.dataPath)
+      script: |
+        #!/usr/bin/env bash
+        set -euxo pipefail
+
+        # ============================================================
+        # MOCK FUNCTIONS - Replace Koji/Kerberos calls with fake data
+        # ============================================================
+
+        echo "=== MOCK MODE ENABLED ==="
+        echo "This task is running with mocked Koji/Kerberos calls"
+        echo "Mock Build ID: ${MOCK_BUILD_ID}"
+        echo "========================="
+
+        # Mock kinit - skip Kerberos authentication
+        function kinit() {
+            echo "MOCK: kinit $* (skipped)"
+            return 0
+        }
+
+        # Track mock build IDs for each component
+        MOCK_BUILD_COUNTER=${MOCK_BUILD_ID}
+
+        # Mock koji command
+        function koji() {
+            echo "MOCK: koji $*" >&2
+            if [[ "$*" == *hello* ]]; then
+                echo "MOCK: Hello, mock user!"
+                echo "You are using MOCK koji"
+            elif [[ "$*" == *buildinfo* ]]; then
+                # Simulate build not existing (so import proceeds)
+                echo "MOCK: Build not found" >&2
+                return 1
+            elif [[ "$*" == *CGInitBuild* ]]; then
+                # Return mock build info
+                MOCK_BUILD_COUNTER=$((MOCK_BUILD_COUNTER + 1))
+                cat <<MOCK_JSON
+        {
+          "build_id": ${MOCK_BUILD_COUNTER},
+          "token": "mock-token-${MOCK_BUILD_COUNTER}"
+        }
+        MOCK_JSON
+            elif [[ "$*" == *import-cg* ]]; then
+                echo "MOCK: Import successful for build"
+            elif [[ "$*" == *list-pkgs* ]]; then
+                # Simulate package not in tag (so add-pkg proceeds)
+                return 1
+            elif [[ "$*" == *add-pkg* ]]; then
+                echo "MOCK: Package added to tag"
+            elif [[ "$*" == *tagBuild* ]]; then
+                echo "MOCK: Build tagged successfully"
+            elif [[ "$*" == *getTag* ]]; then
+                local tag_name
+                tag_name=$(echo "$*" | grep -oE '[^ ]+$')
+                cat <<MOCK_JSON
+        {
+          "id": 1,
+          "name": "${tag_name}",
+          "locked": false,
+          "extra": {"sidetag": false}
+        }
+        MOCK_JSON
+            elif [[ "$*" == *CGRefundBuild* ]]; then
+                echo "MOCK: Build refunded"
+            fi
+        }
+
+        # ============================================================
+        # END MOCK FUNCTIONS
+        # ============================================================
+
+        if [ ! -f "${SNAPSHOT_SPEC_FILE}" ] ; then
+            echo "No valid snapshot file was provided."
+            exit 1
+        fi
+
+        if [ ! -f "${DATA_FILE}" ] ; then
+            echo "No data JSON was provided."
+            exit 1
+        fi
+
+        COMPONENT_GROUP=$(jq -r '.componentGroup' "${SNAPSHOT_SPEC_FILE}")
+        NUM_COMPONENTS=$(jq '.components | length' "${SNAPSHOT_SPEC_FILE}")
+
+        PRINCIPAL=$(jq --exit-status -r '.pushOptions.pushKeytab.principal' "${DATA_FILE}")
+        KEYTAB_FILE=$(jq --exit-status -r '.pushOptions.pushKeytab.name' "${DATA_FILE}")
+        KOJI_PROFILE=$(jq --exit-status -r '.pushOptions.koji_profile' "${DATA_FILE}")
+        KOJI_TAGS=$(jq --exit-status -r '.pushOptions.koji_tags // [] | join(" ")' "${DATA_FILE}")
+        KOJI_IMPORT_DRAFT=$(jq -r '.pushOptions.koji_import_draft' "${DATA_FILE}")
+
+        koji-cmd() {
+            koji --profile="$KOJI_PROFILE" "$@"
+        }
+
+        is_sidetag() {
+            echo "MOCK: Getting tag info for '$1'" > /dev/stderr
+            koji-cmd --noauth call --json-output getTag "$1" |
+              tee /dev/stderr |
+                jq -r '.extra.sidetag'
+        }
+
+        # Fetch the component list from data.pushOptions.components by default
+        RELEASE_COMPONENTS=$(jq -r '
+            if .pushOptions.components then
+                .pushOptions.components[]
+            else
+                empty
+            end' "${DATA_FILE}")
+        if [ -z "$RELEASE_COMPONENTS" ]; then
+            RELEASE_COMPONENTS=$(jq -r '.mapping.components[].name' "$DATA_FILE")
+        fi
+
+        KRB5CCNAME=$(mktemp)
+        export KRB5CCNAME
+
+        cd "$(params.dataDir)/$(dirname "$(params.snapshotPath)")"
+
+        # MOCK: Skip keytab extraction
+        echo "MOCK: Skipping keytab extraction"
+
+        # MOCK: kinit always succeeds
+        kinit "mock-keytab" "mock-principal"
+
+        USER_NAME=$(echo "$PRINCIPAL" | cut -d'@' -f1)
+
+        # Test the mock koji connection
+        koji-cmd hello
+
+        printf 'Start task "%s" for Application "%s" (MOCK MODE)\n\n' "$(context.task.name)" "$COMPONENT_GROUP"
+
+        for ((i = 0; i < NUM_COMPONENTS; i++))
+        do
+          component=$(jq -c --argjson i "$i" '.components[$i]' "${SNAPSHOT_SPEC_FILE}")
+          containerImage=$(jq -r '.containerImage' <<< "$component")
+          componentName=$(jq -r '.name' <<< "$component")
+
+          # Use printf to join the array elements and grep to check for the presence of the variable
+          if ! printf "%s\n" "${RELEASE_COMPONENTS[@]}" | grep -q -x "$componentName"; then
+              printf "Skip the component %s as it is not in the release list.\n" "$componentName"
+              continue
+          fi
+
+          mkdir temp && cd temp
+
+          # Real oras pull - we need the actual container image content
+          authFile=$(mktemp)
+          select-oci-auth "${containerImage}" > "$authFile"
+          oras pull --registry-config "$authFile" "$containerImage"
+
+          SRPM=$(ls ./*.src.rpm)
+          PACKAGE_NVR=$(basename "$SRPM" .src.rpm)
+
+          if [[ "$KOJI_IMPORT_DRAFT" == "false" ]]; then
+              # MOCK: Always proceed with import
+              echo "MOCK: Checking if build exists (will simulate not found)"
+              draft="false"
+              draft_flag=""
+          else
+              draft="true"
+              draft_flag="--draft"
+          fi
+
+          # Get Koji build target from the RPM image annotation
+          koji_target=$(
+            oras manifest fetch "$containerImage" --registry-config "$authFile" |
+              jq --exit-status -r '.annotations."koji.build-target"'
+          )
+          if [ -z "$koji_target" ]; then
+              echo "ERROR: No Koji build target found in the container image annotations."
+              exit 1
+          fi
+
+          koji_tag=${koji_target}
+          # Make sure "-draft" suffix is added to the tag for draft imports
+          if [[ "$draft" == "true" && "$koji_tag" != *-draft ]]; then
+            is_sidetag=$(is_sidetag "$koji_tag")
+            if [[ "$is_sidetag" == "false" ]]; then
+                koji_tag=${koji_tag%-candidate}-draft
+            fi
+          fi
+          KOJI_TAGS="$koji_tag $KOJI_TAGS"
+
+          printf "MOCK: Import rpm %s with tags %s ...\n" "$PACKAGE_NVR" "$KOJI_TAGS"
+
+          # Reserve build ID and import build (MOCKED)
+          build_name=$(jq -r '.build.name' cg_import.json)
+          build_version=$(jq -r '.build.version' cg_import.json)
+          build_release=$(jq -r '.build.release' cg_import.json)
+          build_epoch=$(jq '.build.epoch' cg_import.json)
+          import_build_data=$(jq --compact-output <<EOD
+              {
+                "name": "$build_name",
+                "version": "$build_version",
+                "release": "$build_release",
+                "epoch": $build_epoch,
+                "draft": $draft
+              }
+        EOD
+          )
+
+          # MOCK: CGInitBuild
+          buildinfo=$(koji-cmd call --json CGInitBuild '"konflux"' "$import_build_data")
+          build_id=$(jq --exit-status -r '.build_id' <<< "$buildinfo")
+          token=$(jq --exit-status -r '.token' <<< "$buildinfo")
+
+          echo "MOCK: Importing build $build_id"
+          # MOCK: import-cg always succeeds
+          koji-cmd import-cg $draft_flag cg_import.json --token="$token" --build-id="$build_id" .
+
+          for tag in $KOJI_TAGS; do
+              # MOCK: add-pkg and tagBuild
+              koji-cmd --force add-pkg "$tag" "$build_name" --owner "$USER_NAME"
+              koji-cmd call tagBuild "$tag" "$build_id"
+          done
+
+          # Clean up to handle next component
+          cd .. && rm -rf temp
+        done
+
+        printf 'Completed "%s" for "%s" (MOCK MODE)\n\n' "$(context.task.name)" "$COMPONENT_GROUP"
+      volumeMounts:
+        - mountPath: /etc/secret
+          name: secret-volume
+          readOnly: true
+    - name: create-trusted-artifact
+      computeResources:
+        limits:
+          memory: 128Mi
+          cpu: 250m
+        requests:
+          memory: 128Mi
+          cpu: 250m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: "$(params.taskGitUrl)"
+          - name: revision
+            value: "$(params.taskGitRevision)"
+          - name: pathInRepo
+            value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path)
